@@ -9,8 +9,11 @@ import unittest
 import urllib.request
 from pathlib import Path
 
-from scanner import get_db, init_db, upsert_sessions, insert_turns
-from dashboard import get_dashboard_data, DashboardHandler, HTML_TEMPLATE
+from scanner import get_db, init_db, upsert_sessions, insert_turns, insert_prompts
+from dashboard import (
+    get_dashboard_data, get_session_detail, DashboardHandler, HTML_TEMPLATE,
+    _group_prompts, _score_session,
+)
 
 try:
     from http.server import HTTPServer
@@ -76,6 +79,20 @@ class TestGetDashboardData(unittest.TestCase):
         self.assertEqual(session["model"], "claude-sonnet-4-6")
         self.assertEqual(session["input"], 5000)
 
+    def test_session_by_model_buckets_partition_turn_tokens(self):
+        data = get_dashboard_data(db_path=self.db_path)
+        session = data["sessions_all"][0]
+        self.assertIn("by_model", session)
+        buckets = session["by_model"]
+        # Both turns are sonnet → one bucket summing the turn tokens.
+        self.assertEqual(len(buckets), 1)
+        b = buckets[0]
+        self.assertEqual(b["model"], "claude-sonnet-4-6")
+        self.assertEqual(b["input"], 800)   # 500 + 300
+        self.assertEqual(b["output"], 350)  # 200 + 150
+        self.assertEqual(b["cache_read"], 50)
+        self.assertEqual(b["cache_creation"], 20)
+
     def test_daily_by_model_populated(self):
         data = get_dashboard_data(db_path=self.db_path)
         self.assertGreater(len(data["daily_by_model"]), 0)
@@ -92,6 +109,12 @@ class TestGetDashboardData(unittest.TestCase):
         data = get_dashboard_data(db_path=self.db_path)
         session = data["sessions_all"][0]
         self.assertEqual(len(session["session_id"]), 8)
+
+    def test_session_has_efficiency_and_full_id(self):
+        data = get_dashboard_data(db_path=self.db_path)
+        session = data["sessions_all"][0]
+        self.assertIn(session["efficiency"], ("green", "yellow", "red"))
+        self.assertEqual(session["session_id_full"], "sess-abc123")
 
     def test_session_duration_calculated(self):
         data = get_dashboard_data(db_path=self.db_path)
@@ -249,6 +272,246 @@ class TestNonBillableModelFallback(unittest.TestCase):
         self.assertIn("billable.length ? billable : allModels", HTML_TEMPLATE)
 
 
+class TestGroupPrompts(unittest.TestCase):
+    """Read-time attribution of turns to the prompt that triggered them."""
+
+    def _turn(self, ts, inp=100, out=50, tool=None, model="claude-sonnet-4-6"):
+        return {
+            "timestamp": ts, "model": model, "input_tokens": inp,
+            "output_tokens": out, "cache_read_tokens": 0,
+            "cache_creation_tokens": 0, "tool_name": tool,
+        }
+
+    def test_turns_attributed_to_preceding_prompt(self):
+        prompts = [
+            {"timestamp": "2026-04-08T09:00:00Z", "text": "First"},
+            {"timestamp": "2026-04-08T10:00:00Z", "text": "Second"},
+        ]
+        turns = [
+            self._turn("2026-04-08T09:01:00Z", inp=100),
+            self._turn("2026-04-08T09:02:00Z", inp=200),
+            self._turn("2026-04-08T10:05:00Z", inp=300),
+        ]
+        groups = _group_prompts(prompts, turns)
+        by_text = {g["text"]: g for g in groups}
+        self.assertEqual(by_text["First"]["turn_count"], 2)
+        self.assertEqual(by_text["First"]["input"], 300)
+        self.assertEqual(by_text["Second"]["turn_count"], 1)
+        self.assertEqual(by_text["Second"]["input"], 300)
+
+    def test_turns_before_first_prompt_go_to_initial_bucket(self):
+        prompts = [{"timestamp": "2026-04-08T10:00:00Z", "text": "Later"}]
+        turns = [
+            self._turn("2026-04-08T09:00:00Z", inp=500),  # before any prompt
+            self._turn("2026-04-08T10:01:00Z", inp=100),
+        ]
+        groups = _group_prompts(prompts, turns)
+        initial = [g for g in groups if g["is_initial"]]
+        self.assertEqual(len(initial), 1)
+        self.assertEqual(initial[0]["input"], 500)
+
+    def test_tools_and_model_aggregated(self):
+        prompts = [{"timestamp": "2026-04-08T09:00:00Z", "text": "Do"}]
+        turns = [
+            self._turn("2026-04-08T09:01:00Z", tool="Read"),
+            self._turn("2026-04-08T09:02:00Z", tool="Read"),
+            self._turn("2026-04-08T09:03:00Z", tool="Edit"),
+        ]
+        g = _group_prompts(prompts, turns)[0]
+        tool_map = {t["name"]: t["count"] for t in g["tools"]}
+        self.assertEqual(tool_map, {"Read": 2, "Edit": 1})
+        self.assertEqual(g["model"], "claude-sonnet-4-6")
+
+    def test_zero_turn_prompts_dropped(self):
+        prompts = [{"timestamp": "2026-04-08T09:00:00Z", "text": "No reply yet"}]
+        groups = _group_prompts(prompts, [])
+        self.assertEqual(groups, [])
+
+    def test_by_model_buckets_partition_group_tokens(self):
+        prompts = [{"timestamp": "2026-04-08T09:00:00Z", "text": "Do"}]
+        turns = [
+            self._turn("2026-04-08T09:01:00Z", inp=100, out=10, model="claude-opus-4-7"),
+            self._turn("2026-04-08T09:02:00Z", inp=200, out=20, model="claude-opus-4-7"),
+            self._turn("2026-04-08T09:03:00Z", inp=300, out=30, model="claude-haiku-4-5"),
+        ]
+        g = _group_prompts(prompts, turns)[0]
+        # Dominant model is still the single "model" tag (opus, 2 of 3 turns).
+        self.assertEqual(g["model"], "claude-opus-4-7")
+        buckets = {b["model"]: b for b in g["by_model"]}
+        self.assertEqual(set(buckets), {"claude-opus-4-7", "claude-haiku-4-5"})
+        self.assertEqual(buckets["claude-opus-4-7"]["input"], 300)   # 100 + 200
+        self.assertEqual(buckets["claude-opus-4-7"]["output"], 30)   # 10 + 20
+        self.assertEqual(buckets["claude-haiku-4-5"]["input"], 300)
+        self.assertEqual(buckets["claude-haiku-4-5"]["output"], 30)
+        # Buckets must partition the group's totals exactly.
+        self.assertEqual(sum(b["input"] for b in g["by_model"]), g["input"])
+        self.assertEqual(sum(b["output"] for b in g["by_model"]), g["output"])
+
+    def test_null_model_turns_bucket_as_unknown(self):
+        prompts = [{"timestamp": "2026-04-08T09:00:00Z", "text": "Do"}]
+        turns = [self._turn("2026-04-08T09:01:00Z", inp=100, model=None)]
+        g = _group_prompts(prompts, turns)[0]
+        self.assertEqual([b["model"] for b in g["by_model"]], ["unknown"])
+        self.assertEqual(g["by_model"][0]["input"], 100)
+
+
+class TestScoreSession(unittest.TestCase):
+    """Efficiency scoring heuristics."""
+
+    def _turns(self, n, tool=False, model="claude-sonnet-4-6", inp=100):
+        return [{
+            "input_tokens": inp, "output_tokens": 50, "cache_read_tokens": 0,
+            "cache_creation_tokens": 0, "tool_name": "Read" if tool else None,
+            "model": model,
+        } for _ in range(n)]
+
+    def test_small_session_is_green(self):
+        self.assertEqual(_score_session(self._turns(3), 1), "green")
+
+    def test_marathon_is_red(self):
+        self.assertEqual(_score_session(self._turns(250), 20), "red")
+
+    def test_opus_on_tiny_session_is_yellow(self):
+        turns = self._turns(4, model="claude-opus-4-8")
+        self.assertEqual(_score_session(turns, 2), "yellow")
+
+    def test_runaway_growth_is_red(self):
+        turns = self._turns(3, inp=100) + self._turns(5, inp=100_000)
+        self.assertEqual(_score_session(turns, 2), "red")
+
+
+class TestSessionDetail(unittest.TestCase):
+    """End-to-end get_session_detail against a seeded DB."""
+
+    def setUp(self):
+        self.tmpfile = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmpfile.close()
+        self.db_path = Path(self.tmpfile.name)
+        conn = get_db(self.db_path)
+        init_db(conn)
+        upsert_sessions(conn, [{
+            "session_id": "sess-detail", "project_name": "u/p",
+            "first_timestamp": "2026-04-08T09:00:00Z",
+            "last_timestamp": "2026-04-08T09:10:00Z",
+            "git_branch": "main", "model": "claude-sonnet-4-6",
+            "total_input_tokens": 300, "total_output_tokens": 150,
+            "total_cache_read": 0, "total_cache_creation": 0,
+            "turn_count": 3,
+        }])
+        insert_turns(conn, [
+            {"session_id": "sess-detail", "timestamp": "2026-04-08T09:01:00Z",
+             "model": "claude-sonnet-4-6", "input_tokens": 100, "output_tokens": 50,
+             "cache_read_tokens": 0, "cache_creation_tokens": 0, "tool_name": "Read",
+             "cwd": "/tmp", "message_id": "m1"},
+            {"session_id": "sess-detail", "timestamp": "2026-04-08T09:06:00Z",
+             "model": "claude-sonnet-4-6", "input_tokens": 200, "output_tokens": 100,
+             "cache_read_tokens": 0, "cache_creation_tokens": 0, "tool_name": None,
+             "cwd": "/tmp", "message_id": "m2"},
+        ])
+        insert_prompts(conn, [
+            {"uuid": "p1", "session_id": "sess-detail",
+             "timestamp": "2026-04-08T09:00:30Z", "text": "First task"},
+            {"uuid": "p2", "session_id": "sess-detail",
+             "timestamp": "2026-04-08T09:05:30Z", "text": "Second task"},
+        ])
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        os.unlink(self.db_path)
+
+    def test_returns_prompt_groups(self):
+        d = get_session_detail("sess-detail", db_path=self.db_path)
+        self.assertNotIn("error", d)
+        texts = [g["text"] for g in d["prompts"]]
+        self.assertEqual(texts, ["First task", "Second task"])
+        self.assertEqual(d["prompts"][0]["input"], 100)
+        self.assertEqual(d["prompts"][1]["input"], 200)
+
+    def test_insights_is_a_list(self):
+        d = get_session_detail("sess-detail", db_path=self.db_path)
+        self.assertIsInstance(d["insights"], list)
+
+    def test_unknown_session_returns_error(self):
+        d = get_session_detail("does-not-exist", db_path=self.db_path)
+        self.assertIn("error", d)
+
+    def test_command_wrapper_prompts_filtered_at_read(self):
+        conn = get_db(self.db_path)
+        insert_prompts(conn, [{
+            "uuid": "p3", "session_id": "sess-detail",
+            "timestamp": "2026-04-08T09:00:40Z",
+            "text": "<command-name>/model</command-name>",
+        }])
+        conn.commit()
+        conn.close()
+        d = get_session_detail("sess-detail", db_path=self.db_path)
+        for g in d["prompts"]:
+            self.assertNotIn("command-name", (g["text"] or ""))
+
+
+class TestSessionEndpointHTTP(unittest.TestCase):
+    """/api/session route behavior on the running server."""
+
+    @classmethod
+    def setUpClass(cls):
+        import dashboard as _d
+        cls._tmpfile = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        cls._tmpfile.close()
+        cls._db_path = Path(cls._tmpfile.name)
+        conn = get_db(cls._db_path)
+        init_db(conn)
+        upsert_sessions(conn, [{
+            "session_id": "http-sess", "project_name": "u/p",
+            "first_timestamp": "2026-04-08T09:00:00Z",
+            "last_timestamp": "2026-04-08T09:05:00Z",
+            "git_branch": "main", "model": "claude-sonnet-4-6",
+            "total_input_tokens": 100, "total_output_tokens": 50,
+            "total_cache_read": 0, "total_cache_creation": 0, "turn_count": 1,
+        }])
+        insert_turns(conn, [{
+            "session_id": "http-sess", "timestamp": "2026-04-08T09:01:00Z",
+            "model": "claude-sonnet-4-6", "input_tokens": 100, "output_tokens": 50,
+            "cache_read_tokens": 0, "cache_creation_tokens": 0, "tool_name": None,
+            "cwd": "/tmp", "message_id": "hm1"},
+        ])
+        insert_prompts(conn, [{
+            "uuid": "hp1", "session_id": "http-sess",
+            "timestamp": "2026-04-08T09:00:30Z", "text": "HTTP prompt"}])
+        conn.commit()
+        conn.close()
+
+        cls._orig_db = _d.DB_PATH
+        _d.DB_PATH = cls._db_path
+        cls.server = HTTPServer(("127.0.0.1", 0), DashboardHandler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever)
+        cls.thread.daemon = True
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        import dashboard as _d
+        cls.server.shutdown()
+        _d.DB_PATH = cls._orig_db
+        os.unlink(cls._db_path)
+
+    def test_session_endpoint_returns_detail(self):
+        url = f"http://127.0.0.1:{self.port}/api/session?id=http-sess"
+        with urllib.request.urlopen(url) as resp:
+            self.assertEqual(resp.status, 200)
+            data = json.loads(resp.read())
+            self.assertEqual(data["session_id"], "http-sess")
+            self.assertEqual(data["prompts"][0]["text"], "HTTP prompt")
+
+    def test_session_endpoint_missing_id(self):
+        url = f"http://127.0.0.1:{self.port}/api/session"
+        with urllib.request.urlopen(url) as resp:
+            self.assertEqual(resp.status, 200)
+            data = json.loads(resp.read())
+            self.assertIn("error", data)
+
+
 class TestDashboardHTTP(unittest.TestCase):
     """Integration test: start server and make HTTP requests."""
 
@@ -369,6 +632,13 @@ class TestHTMLTemplate(unittest.TestCase):
         """Peak-hour set covers UTC 12–17 (Mon–Fri 05:00–11:00 PT)."""
         self.assertIn('PEAK_HOURS_UTC', HTML_TEMPLATE)
         self.assertIn('[12, 13, 14, 15, 16, 17]', HTML_TEMPLATE)
+
+    def test_efficiency_dot_and_expand_present(self):
+        """Per-session efficiency dot + expandable prompt breakdown wiring."""
+        self.assertIn(".eff-dot", HTML_TEMPLATE)
+        self.assertIn("function toggleSession", HTML_TEMPLATE)
+        self.assertIn("function renderSessionDetail", HTML_TEMPLATE)
+        self.assertIn("/api/session?id=", HTML_TEMPLATE)
 
     def test_today_range_button_present(self):
         """The 'Today' range button is wired into RANGE_LABELS, RANGE_TICKS,

@@ -10,7 +10,25 @@ from pathlib import Path
 from scanner import (
     get_db, init_db, project_name_from_cwd, parse_jsonl_file,
     aggregate_sessions, upsert_sessions, insert_turns, scan,
+    extract_user_prompt, insert_prompts,
 )
+
+
+def _make_prompt_record(session_id="sess-1", uuid="u-1", text="Fix the login bug",
+                        timestamp="2026-04-08T09:59:00Z", is_meta=False,
+                        is_sidechain=False, content=None):
+    rec = {
+        "type": "user",
+        "sessionId": session_id,
+        "uuid": uuid,
+        "timestamp": timestamp,
+        "message": {"role": "user", "content": text if content is None else content},
+    }
+    if is_meta:
+        rec["isMeta"] = True
+    if is_sidechain:
+        rec["isSidechain"] = True
+    return json.dumps(rec)
 
 
 class TestProjectNameFromCwd(unittest.TestCase):
@@ -89,7 +107,7 @@ class TestParseJsonlFile(unittest.TestCase):
             _make_user_record(),
             _make_assistant_record(),
         ])
-        metas, turns, line_count = parse_jsonl_file(path)
+        metas, turns, _prompts, line_count = parse_jsonl_file(path)
         self.assertEqual(len(metas), 1)
         self.assertEqual(len(turns), 1)
         self.assertEqual(metas[0]["session_id"], "sess-1")
@@ -102,7 +120,7 @@ class TestParseJsonlFile(unittest.TestCase):
             _make_assistant_record(input_tokens=0, output_tokens=0,
                                    cache_read=0, cache_creation=0),
         ])
-        _, turns, _ = parse_jsonl_file(path)
+        _, turns, _, _ = parse_jsonl_file(path)
         self.assertEqual(len(turns), 0)
 
     def test_skips_non_assistant_user_types(self):
@@ -110,7 +128,7 @@ class TestParseJsonlFile(unittest.TestCase):
             json.dumps({"type": "system", "sessionId": "s1"}),
             _make_assistant_record(session_id="s1"),
         ])
-        metas, turns, _ = parse_jsonl_file(path)
+        metas, turns, _, _ = parse_jsonl_file(path)
         self.assertEqual(len(turns), 1)
 
     def test_handles_malformed_json(self):
@@ -118,12 +136,12 @@ class TestParseJsonlFile(unittest.TestCase):
             "not valid json",
             _make_assistant_record(),
         ])
-        _, turns, _ = parse_jsonl_file(path)
+        _, turns, _, _ = parse_jsonl_file(path)
         self.assertEqual(len(turns), 1)
 
     def test_handles_empty_file(self):
         path = self._write_jsonl("test.jsonl", [])
-        metas, turns, _ = parse_jsonl_file(path)
+        metas, turns, _, _ = parse_jsonl_file(path)
         self.assertEqual(len(metas), 0)
         self.assertEqual(len(turns), 0)
 
@@ -132,7 +150,7 @@ class TestParseJsonlFile(unittest.TestCase):
             _make_assistant_record(session_id="s1"),
             _make_assistant_record(session_id="s2"),
         ])
-        metas, turns, _ = parse_jsonl_file(path)
+        metas, turns, _, _ = parse_jsonl_file(path)
         self.assertEqual(len(metas), 2)
         self.assertEqual(len(turns), 2)
 
@@ -142,7 +160,7 @@ class TestParseJsonlFile(unittest.TestCase):
             _make_assistant_record(timestamp="2026-04-08T09:05:00Z"),
             _make_assistant_record(timestamp="2026-04-08T09:10:00Z"),
         ])
-        metas, _, _ = parse_jsonl_file(path)
+        metas, _, _, _ = parse_jsonl_file(path)
         self.assertEqual(metas[0]["first_timestamp"], "2026-04-08T09:00:00Z")
         self.assertEqual(metas[0]["last_timestamp"], "2026-04-08T09:10:00Z")
 
@@ -161,8 +179,151 @@ class TestParseJsonlFile(unittest.TestCase):
             },
         })
         path = self._write_jsonl("test.jsonl", [record])
-        _, turns, _ = parse_jsonl_file(path)
+        _, turns, _, _ = parse_jsonl_file(path)
         self.assertEqual(turns[0]["tool_name"], "Read")
+
+
+class TestExtractUserPrompt(unittest.TestCase):
+    """Unit tests for the extract_user_prompt filter."""
+
+    def _rec(self, **kw):
+        return json.loads(_make_prompt_record(**kw))
+
+    def test_captures_plain_prompt(self):
+        p = extract_user_prompt(self._rec(text="Refactor the parser"))
+        self.assertIsNotNone(p)
+        self.assertEqual(p["text"], "Refactor the parser")
+        self.assertEqual(p["uuid"], "u-1")
+        self.assertEqual(p["session_id"], "sess-1")
+
+    def test_captures_text_from_content_blocks(self):
+        content = [{"type": "text", "text": "Hello there"}]
+        p = extract_user_prompt(self._rec(content=content))
+        self.assertIsNotNone(p)
+        self.assertEqual(p["text"], "Hello there")
+
+    def test_skips_meta(self):
+        self.assertIsNone(extract_user_prompt(self._rec(is_meta=True)))
+
+    def test_skips_sidechain(self):
+        self.assertIsNone(extract_user_prompt(self._rec(is_sidechain=True)))
+
+    def test_skips_command_name_wrapper(self):
+        self.assertIsNone(extract_user_prompt(self._rec(text="<command-name>/model</command-name>")))
+
+    def test_skips_command_message_wrapper(self):
+        self.assertIsNone(extract_user_prompt(self._rec(text="<command-message>brainstorm</command-message>")))
+
+    def test_skips_local_command(self):
+        self.assertIsNone(extract_user_prompt(self._rec(text="<local-command-stdout>done</local-command-stdout>")))
+
+    def test_skips_tool_result_message(self):
+        content = [{"type": "tool_result", "content": "file contents"}]
+        self.assertIsNone(extract_user_prompt(self._rec(content=content)))
+
+    def test_skips_empty_text(self):
+        self.assertIsNone(extract_user_prompt(self._rec(text="   ")))
+
+    def test_skips_missing_uuid(self):
+        rec = self._rec()
+        del rec["uuid"]
+        self.assertIsNone(extract_user_prompt(rec))
+
+    def test_truncates_long_text(self):
+        p = extract_user_prompt(self._rec(text="x" * 1000))
+        self.assertEqual(len(p["text"]), 500)
+
+
+class TestPromptCaptureIntegration(unittest.TestCase):
+    """Prompt capture through parse_jsonl_file and scan (with dedup)."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.projects_dir = Path(self.tmpdir) / "projects" / "user" / "proj"
+        self.projects_dir.mkdir(parents=True)
+        self.db_path = Path(self.tmpdir) / "usage.db"
+        self.filepath = self.projects_dir / "sess-1.jsonl"
+
+    def test_parse_returns_prompts(self):
+        path = str(self.filepath)
+        with open(path, "w") as f:
+            f.write(_make_prompt_record(uuid="u-1", text="First prompt") + "\n")
+            f.write(_make_assistant_record(session_id="sess-1") + "\n")
+            f.write(_make_prompt_record(uuid="u-2", text="Second prompt",
+                                        timestamp="2026-04-08T10:05:00Z") + "\n")
+        _, _, prompts, _ = parse_jsonl_file(path)
+        texts = sorted(p["text"] for p in prompts)
+        self.assertEqual(texts, ["First prompt", "Second prompt"])
+
+    def test_scan_populates_prompts_table(self):
+        with open(self.filepath, "w") as f:
+            f.write(_make_prompt_record(uuid="u-1", text="Do the thing") + "\n")
+            f.write(_make_assistant_record(session_id="sess-1") + "\n")
+
+        scan(projects_dir=self.projects_dir.parent.parent,
+             db_path=self.db_path, verbose=False)
+
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM prompts").fetchall()
+        conn.close()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["text"], "Do the thing")
+        self.assertEqual(rows[0]["session_id"], "sess-1")
+
+    def test_prompt_uuid_dedup_across_rescan(self):
+        with open(self.filepath, "w") as f:
+            f.write(_make_prompt_record(uuid="u-1", text="Only once") + "\n")
+            f.write(_make_assistant_record(session_id="sess-1") + "\n")
+
+        scan(projects_dir=self.projects_dir.parent.parent,
+             db_path=self.db_path, verbose=False)
+
+        # Force a full re-scan of the same file.
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("DELETE FROM processed_files")
+        conn.commit()
+        conn.close()
+
+        scan(projects_dir=self.projects_dir.parent.parent,
+             db_path=self.db_path, verbose=False)
+
+        conn = sqlite3.connect(self.db_path)
+        count = conn.execute("SELECT COUNT(*) FROM prompts").fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 1)
+
+    def test_incremental_scan_captures_new_prompt(self):
+        with open(self.filepath, "w") as f:
+            f.write(_make_prompt_record(uuid="u-1", text="First") + "\n")
+            f.write(_make_assistant_record(session_id="sess-1") + "\n")
+        scan(projects_dir=self.projects_dir.parent.parent,
+             db_path=self.db_path, verbose=False)
+
+        import time
+        time.sleep(0.05)
+        with open(self.filepath, "a") as f:
+            f.write(_make_prompt_record(uuid="u-2", text="Second appended",
+                                        timestamp="2026-04-08T11:00:00Z") + "\n")
+            f.write(_make_assistant_record(session_id="sess-1",
+                                           timestamp="2026-04-08T11:01:00Z",
+                                           message_id="msg-late") + "\n")
+        scan(projects_dir=self.projects_dir.parent.parent,
+             db_path=self.db_path, verbose=False)
+
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        texts = sorted(r["text"] for r in conn.execute("SELECT text FROM prompts"))
+        conn.close()
+        self.assertEqual(texts, ["First", "Second appended"])
+
+    def test_init_db_creates_prompts_table(self):
+        conn = get_db(self.db_path)
+        init_db(conn)
+        tables = {r["name"] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        conn.close()
+        self.assertIn("prompts", tables)
 
 
 class TestMessageIdDedup(unittest.TestCase):
@@ -188,7 +349,7 @@ class TestMessageIdDedup(unittest.TestCase):
             # Streaming event 3: final usage (same message)
             _make_assistant_record(message_id="msg-abc", input_tokens=150, output_tokens=80),
         ])
-        _, turns, _ = parse_jsonl_file(path)
+        _, turns, _, _ = parse_jsonl_file(path)
         self.assertEqual(len(turns), 1)
         # Last record wins (has final tallies)
         self.assertEqual(turns[0]["input_tokens"], 150)
@@ -201,7 +362,7 @@ class TestMessageIdDedup(unittest.TestCase):
             _make_assistant_record(message_id="msg-1", input_tokens=100),
             _make_assistant_record(message_id="msg-2", input_tokens=200),
         ])
-        _, turns, _ = parse_jsonl_file(path)
+        _, turns, _, _ = parse_jsonl_file(path)
         self.assertEqual(len(turns), 2)
 
     def test_records_without_message_id_kept(self):
@@ -210,7 +371,7 @@ class TestMessageIdDedup(unittest.TestCase):
             _make_assistant_record(input_tokens=100),
             _make_assistant_record(input_tokens=200),
         ])
-        _, turns, _ = parse_jsonl_file(path)
+        _, turns, _, _ = parse_jsonl_file(path)
         self.assertEqual(len(turns), 2)
 
     def test_mixed_with_and_without_ids(self):
@@ -220,7 +381,7 @@ class TestMessageIdDedup(unittest.TestCase):
             _make_assistant_record(message_id="msg-1", input_tokens=100),  # deduped
             _make_assistant_record(input_tokens=200),  # no id, kept
         ])
-        _, turns, _ = parse_jsonl_file(path)
+        _, turns, _, _ = parse_jsonl_file(path)
         self.assertEqual(len(turns), 2)  # 1 deduped + 1 without id
         token_sums = sorted([t["input_tokens"] for t in turns])
         self.assertEqual(token_sums, [100, 200])
@@ -664,14 +825,14 @@ class TestParseJsonlFileLineCount(unittest.TestCase):
             f.write(_make_user_record() + "\n")
             f.write(_make_assistant_record() + "\n")
             f.write(_make_assistant_record(timestamp="2026-04-08T10:01:00Z") + "\n")
-        _, _, line_count = parse_jsonl_file(path)
+        _, _, _, line_count = parse_jsonl_file(path)
         self.assertEqual(line_count, 3)
 
     def test_empty_file_returns_zero(self):
         path = os.path.join(self.tmpdir, "empty.jsonl")
         with open(path, "w") as f:
             pass
-        _, _, line_count = parse_jsonl_file(path)
+        _, _, _, line_count = parse_jsonl_file(path)
         self.assertEqual(line_count, 0)
 
 
