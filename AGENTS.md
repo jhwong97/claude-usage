@@ -39,7 +39,7 @@ CI ([.github/workflows/tests.yml](.github/workflows/tests.yml)) runs the suite o
 ```
 ~/.claude/projects/**/*.jsonl   →   scanner.parse_jsonl_file()
 ~/Library/.../Xcode/...                  ↓
-                              aggregate_sessions() → upsert_sessions() + insert_turns()
+          aggregate_sessions() → upsert_sessions() + insert_turns() + insert_prompts()
                                          ↓
                               ~/.claude/usage.db (SQLite)
                                          ↓
@@ -52,9 +52,12 @@ By default the scanner walks both `~/.claude/projects/` and the Xcode coding-ass
 
 - **`turns`** — one row per assistant API response. The source of truth for tokens and per-model attribution.
 - **`sessions`** — aggregated per session (denormalized totals + chosen primary model).
+- **`prompts`** — one row per genuine user prompt: `(uuid, session_id, timestamp, text)`. `uuid` is the JSONL record's own uuid (PK → cheap `INSERT OR IGNORE` dedup). `extract_user_prompt` filters out meta records, slash-command wrappers (`<command-…>`, `<local-command…>`), tool-result messages, and subagent (`isSidechain`) prompts. Capture is independent of turn dedup, so an incremental scan that splits a response across runs still stores the prompt exactly once.
 - **`processed_files`** — incremental-scan tracking: `(path, mtime, lines)`. A file is skipped if its mtime matches; if it grew, only lines past the stored `lines` count are processed.
 
 A conditional unique index on `turns.message_id` (where non-empty) lets `INSERT OR IGNORE` cheaply dedupe replays across rescans.
+
+Turns are **not** stored with a prompt id. Instead the dashboard attributes each turn to the prompt that triggered it **at read time**, by timestamp: a turn belongs to the most recent prompt at or before it, and turns before the first prompt fall into an "initial context" bucket (`_group_prompts` in [dashboard.py](dashboard.py)). This stays correct even when a response is split across incremental scans, and needs no migration of `turns`.
 
 ### Non-obvious invariants
 
@@ -78,9 +81,12 @@ Pricing is duplicated in two places that **must stay in sync**:
 
 ### Dashboard server
 
-`http.server.BaseHTTPRequestHandler`-based, two endpoints:
-- `GET /api/data` → JSON snapshot from `get_dashboard_data()`. Returns *all* history; client-side filters by date range and model.
+`http.server.BaseHTTPRequestHandler`-based, three endpoints:
+- `GET /api/data` → JSON snapshot from `get_dashboard_data()`. Returns *all* history; client-side filters by date range and model. Each session also carries a token-only `efficiency` label (`green`/`yellow`/`red`, from `_score_session`) and its full `session_id_full`.
+- `GET /api/session?id=<session_id>` → per-session detail loaded lazily when a session row is expanded: the per-prompt cost breakdown (`_group_prompts`) plus scoped inefficiency insights (`_session_insights`). Costs are computed client-side via the JS `calcCost` so pricing stays in one place. The handler passes `db_path=DB_PATH` explicitly (frozen-defaults rule below).
 - `POST /api/rescan` → deletes the DB and runs a full rescan. Passes `db_path` and `projects_dirs` explicitly so tests that monkey-patch the module globals work — scan's default arg values are frozen at def time, so don't switch to bare defaults.
+
+The efficiency label and insights use **token-based signals only** (no pricing) so no cost logic leaks into Python; the two `PRICING` copies stay put.
 
 The entire UI lives in `HTML_TEMPLATE` as a raw string. Chart.js is loaded from CDN.
 

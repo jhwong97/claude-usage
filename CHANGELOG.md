@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.3.0 — TBD
+
+### Dashboard
+
+- Recent Sessions rows are now expandable: click a session to reveal a per-prompt cost breakdown (the user prompt that triggered each group of turns, with its tokens, estimated cost, and tools) so you can see what each prompt actually cost. The most expensive prompts in a session are highlighted.
+- Each session row shows a small efficiency dot (green / amber / red) summarising how efficient the session was, based on token-only signals (context growth, marathon length, Opus-on-a-tiny-session, tool-call-heavy conversations).
+- The expanded view surfaces per-session inefficiency insights with actionable tips (short/vague expensive prompts, cost-per-turn growth with a `/clear` suggestion, Opus used for a small session, tool-heavy conversations, cache hit rate).
+- New `GET /api/session?id=<session_id>` endpoint returns the per-session prompt breakdown and insights (loaded lazily on expand). CSV export now includes an Efficiency column.
+
+### Scanner
+
+- The scanner now captures the text of genuine user prompts into a new `prompts` table (deduped by record `uuid`), excluding meta records, slash-command wrappers, tool-result messages, and subagent prompts. Turns are attributed to prompts at read time by timestamp, so incremental scans stay correct.
+
 ## v1.2.4 — 2026-05-30
 
 ### Dashboard
