@@ -68,6 +68,13 @@ def init_db(conn):
             message_id              TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS prompts (
+            uuid        TEXT PRIMARY KEY,
+            session_id  TEXT,
+            timestamp   TEXT,
+            text        TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS processed_files (
             path    TEXT PRIMARY KEY,
             mtime   REAL,
@@ -77,6 +84,7 @@ def init_db(conn):
         CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
         CREATE INDEX IF NOT EXISTS idx_turns_timestamp ON turns(timestamp);
         CREATE INDEX IF NOT EXISTS idx_sessions_first ON sessions(first_timestamp);
+        CREATE INDEX IF NOT EXISTS idx_prompts_session ON prompts(session_id);
     """)
     # Add message_id column if upgrading from older schema
     try:
@@ -102,8 +110,59 @@ def project_name_from_cwd(cwd):
     return parts[-1] if parts else "unknown"
 
 
+def extract_user_prompt(record):
+    """Return a prompt dict for a genuine human-typed user prompt, else None.
+
+    Excludes the noise that isn't a real prompt trigger: meta records,
+    subagent (sidechain) prompts, slash-command wrappers, and tool-result
+    messages (which are tool output being fed back, not something the user
+    typed). The record's own ``uuid`` is used as the dedup key.
+    """
+    if record.get("type") != "user":
+        return None
+    if record.get("isMeta") or record.get("isSidechain"):
+        return None
+
+    msg = record.get("message")
+    if not isinstance(msg, dict) or msg.get("role") != "user":
+        return None
+
+    content = msg.get("content")
+    if isinstance(content, str):
+        text = content.strip()
+    elif isinstance(content, list):
+        # A message carrying tool_result blocks is tool output, not a prompt.
+        if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+            return None
+        text = "\n".join(
+            b.get("text", "") for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        ).strip()
+    else:
+        return None
+
+    if not text:
+        return None
+    # Slash-command wrappers (<command-name>, <command-message>, ...) and
+    # local-command output aren't prompts the user typed.
+    if text.startswith("<command-") or text.startswith("<local-command"):
+        return None
+
+    uuid = record.get("uuid")
+    session_id = record.get("sessionId")
+    if not uuid or not session_id:
+        return None
+
+    return {
+        "uuid": uuid,
+        "session_id": session_id,
+        "timestamp": record.get("timestamp", ""),
+        "text": text[:500],
+    }
+
+
 def parse_jsonl_file(filepath):
-    """Parse a JSONL file and return (session_metas, turns, line_count).
+    """Parse a JSONL file and return (session_metas, turns, prompts, line_count).
 
     Deduplicates streaming events by message.id — Claude Code logs multiple
     JSONL records per API response, all sharing the same message.id. Only the
@@ -111,6 +170,7 @@ def parse_jsonl_file(filepath):
     """
     seen_messages = {}  # message_id -> turn dict (dedup streaming records)
     turns_no_id = []    # turns without a message_id (kept as-is)
+    prompts = {}        # uuid -> prompt dict (dedup by record uuid)
     session_meta = {}   # session_id -> dict
     line_count = 0
 
@@ -155,6 +215,11 @@ def parse_jsonl_file(filepath):
                         meta["last_timestamp"] = timestamp
                     if git_branch and not meta["git_branch"]:
                         meta["git_branch"] = git_branch
+
+                if rtype == "user":
+                    prompt = extract_user_prompt(record)
+                    if prompt:
+                        prompts[prompt["uuid"]] = prompt
 
                 if rtype == "assistant":
                     msg = record.get("message", {})
@@ -204,7 +269,7 @@ def parse_jsonl_file(filepath):
         print(f"  Warning: error reading {filepath}: {e}")
 
     turns = turns_no_id + list(seen_messages.values())
-    return list(session_meta.values()), turns, line_count
+    return list(session_meta.values()), turns, list(prompts.values()), line_count
 
 
 def aggregate_sessions(session_metas, turns):
@@ -314,6 +379,17 @@ def insert_turns(conn, turns):
     ])
 
 
+def insert_prompts(conn, prompts):
+    """Insert user prompts, deduping by record uuid across rescans."""
+    conn.executemany("""
+        INSERT OR IGNORE INTO prompts (uuid, session_id, timestamp, text)
+        VALUES (?, ?, ?, ?)
+    """, [
+        (p["uuid"], p["session_id"], p["timestamp"], p["text"])
+        for p in prompts
+    ])
+
+
 def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
     conn = get_db(db_path)
     init_db(conn)
@@ -362,12 +438,13 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
 
         if is_new:
             # New file: full parse (single read, returns line count)
-            session_metas, turns, line_count = parse_jsonl_file(filepath)
+            session_metas, turns, prompts, line_count = parse_jsonl_file(filepath)
 
             if turns or session_metas:
                 sessions = aggregate_sessions(session_metas, turns)
                 upsert_sessions(conn, sessions)
                 insert_turns(conn, turns)
+                insert_prompts(conn, prompts)
                 for s in sessions:
                     total_sessions.add(s["session_id"])
                 total_turns += len(turns)
@@ -378,6 +455,7 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
             old_lines = row["lines"] if row else 0
             seen_messages = {}  # message_id -> turn (dedup streaming)
             turns_no_id = []
+            new_prompts = {}    # uuid -> prompt (dedup by record uuid)
             new_session_metas = {}
             line_count = 0
 
@@ -421,6 +499,11 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
                                 meta["last_timestamp"] = timestamp
                             if timestamp and (not meta["first_timestamp"] or timestamp < meta["first_timestamp"]):
                                 meta["first_timestamp"] = timestamp
+
+                        if rtype == "user":
+                            prompt = extract_user_prompt(record)
+                            if prompt:
+                                new_prompts[prompt["uuid"]] = prompt
 
                         if rtype == "assistant":
                             msg = record.get("message", {})
@@ -479,6 +562,7 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
                 sessions = aggregate_sessions(list(new_session_metas.values()), new_turns)
                 upsert_sessions(conn, sessions)
                 insert_turns(conn, new_turns)
+                insert_prompts(conn, list(new_prompts.values()))
                 for s in sessions:
                     total_sessions.add(s["session_id"])
                 total_turns += len(new_turns)

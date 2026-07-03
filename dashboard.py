@@ -6,7 +6,7 @@ import json
 import os
 import sqlite3
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 from datetime import datetime
 
@@ -14,6 +14,8 @@ DB_PATH = Path.home() / ".claude" / "usage.db"
 
 
 def get_dashboard_data(db_path=DB_PATH):
+    from collections import defaultdict
+
     if not db_path.exists():
         return {"error": "Database not found. Run: python cli.py scan"}
 
@@ -90,6 +92,34 @@ def get_dashboard_data(db_path=DB_PATH):
         ORDER BY last_timestamp DESC
     """).fetchall()
 
+    efficiency_map = _session_efficiency_map(conn)
+
+    # ── Per-session per-model token buckets ───────────────────────────────────
+    # Cost must be summed per model (each model has its own price); collapsing a
+    # multi-model session to a single "primary" model mis-prices it. The client
+    # sums calcCost over these buckets so session/project/prompt costs all agree.
+    bucket_rows = conn.execute("""
+        SELECT
+            session_id,
+            COALESCE(NULLIF(model, ''), 'unknown') as model,
+            SUM(input_tokens)          as input,
+            SUM(output_tokens)         as output,
+            SUM(cache_read_tokens)     as cache_read,
+            SUM(cache_creation_tokens) as cache_creation
+        FROM turns
+        GROUP BY session_id, COALESCE(NULLIF(model, ''), 'unknown')
+    """).fetchall()
+
+    buckets_by_session = defaultdict(list)
+    for r in bucket_rows:
+        buckets_by_session[r["session_id"]].append({
+            "model":          r["model"],
+            "input":          r["input"] or 0,
+            "output":         r["output"] or 0,
+            "cache_read":     r["cache_read"] or 0,
+            "cache_creation": r["cache_creation"] or 0,
+        })
+
     sessions_all = []
     for r in session_rows:
         try:
@@ -100,6 +130,7 @@ def get_dashboard_data(db_path=DB_PATH):
             duration_min = 0
         sessions_all.append({
             "session_id":    r["session_id"][:8],
+            "session_id_full": r["session_id"],
             "project":       r["project_name"] or "unknown",
             "branch":        r["git_branch"] or "",
             "last":          (r["last_timestamp"] or "")[:16].replace("T", " "),
@@ -111,6 +142,8 @@ def get_dashboard_data(db_path=DB_PATH):
             "output":        r["total_output_tokens"] or 0,
             "cache_read":    r["total_cache_read"] or 0,
             "cache_creation": r["total_cache_creation"] or 0,
+            "efficiency":    efficiency_map.get(r["session_id"], "green"),
+            "by_model":      buckets_by_session.get(r["session_id"], []),
         })
 
     conn.close()
@@ -121,6 +154,286 @@ def get_dashboard_data(db_path=DB_PATH):
         "hourly_by_model": hourly_by_model,
         "sessions_all":    sessions_all,
         "generated_at":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def _turn_total(t):
+    return ((t["input_tokens"] or 0) + (t["output_tokens"] or 0)
+            + (t["cache_read_tokens"] or 0) + (t["cache_creation_tokens"] or 0))
+
+
+def _score_session(turns, prompt_count):
+    """Return an efficiency label ('green'|'yellow'|'red') from a session's
+    turns. Token-based only (no pricing) so it can run over every session
+    cheaply on each dashboard load.
+
+    Signals: marathon length, cost-per-turn growth, Opus-on-a-tiny-session,
+    and tool-call-heavy conversations. Two moderate flags (or one severe one)
+    tip a session into red; a single moderate flag is yellow.
+    """
+    n = len(turns)
+    if n == 0:
+        return "green"
+
+    totals = [_turn_total(t) for t in turns]
+    total_tokens = sum(totals)
+    tool_turns = sum(1 for t in turns if t["tool_name"])
+
+    from collections import Counter
+    model_counts = Counter(t["model"] for t in turns if t["model"])
+    model = (model_counts.most_common(1)[0][0] if model_counts else "").lower()
+
+    growth = 1.0
+    if n >= 8:
+        first3 = sum(totals[:3]) / 3
+        last3 = sum(totals[-3:]) / 3
+        if first3 > 0:
+            growth = last3 / first3
+
+    score = 0
+    if n > 200:                                              # marathon (severe)
+        score += 2
+    if growth > 4:                                           # runaway context (severe)
+        score += 2
+    elif growth > 2:                                         # growing context (moderate)
+        score += 1
+    if "opus" in model and n < 10 and total_tokens < 200_000:  # overkill model (moderate)
+        score += 1
+    if prompt_count > 0 and tool_turns / prompt_count > 8:  # tool-heavy (moderate)
+        score += 1
+
+    if score >= 2:
+        return "red"
+    if score == 1:
+        return "yellow"
+    return "green"
+
+
+def _session_efficiency_map(conn):
+    """Compute the efficiency label for every session in one pass over turns."""
+    from collections import defaultdict
+
+    prompt_counts = {}
+    for r in conn.execute(
+        "SELECT session_id, COUNT(*) AS c FROM prompts GROUP BY session_id"
+    ):
+        prompt_counts[r["session_id"]] = r["c"]
+
+    per_session = defaultdict(list)
+    for r in conn.execute("""
+        SELECT session_id, input_tokens, output_tokens, cache_read_tokens,
+               cache_creation_tokens, tool_name, model
+        FROM turns
+        ORDER BY session_id, timestamp, id
+    """):
+        per_session[r["session_id"]].append(r)
+
+    return {
+        sid: _score_session(turns, prompt_counts.get(sid, 0))
+        for sid, turns in per_session.items()
+    }
+
+
+def _fmt_tokens(n):
+    n = n or 0
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 10_000:
+        return f"{n / 1_000:.0f}K"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
+
+
+def _group_prompts(prompts, turns):
+    """Attribute each assistant turn to the user prompt that triggered it.
+
+    Both lists are timestamp-ordered; a turn belongs to the most recent prompt
+    that started at or before it. Turns that precede the first prompt (session
+    startup context, subagent work) collect in an 'initial context' bucket.
+    """
+    def new_group(text, timestamp, is_initial=False):
+        return {
+            "text": text, "timestamp": timestamp, "is_initial": is_initial,
+            "input": 0, "output": 0, "cache_read": 0, "cache_creation": 0,
+            "turn_count": 0, "tools": {}, "_models": {}, "_model_tokens": {},
+        }
+
+    def add_turn(g, t):
+        g["input"] += t["input_tokens"] or 0
+        g["output"] += t["output_tokens"] or 0
+        g["cache_read"] += t["cache_read_tokens"] or 0
+        g["cache_creation"] += t["cache_creation_tokens"] or 0
+        g["turn_count"] += 1
+        if t["tool_name"]:
+            g["tools"][t["tool_name"]] = g["tools"].get(t["tool_name"], 0) + 1
+        if t["model"]:
+            g["_models"][t["model"]] = g["_models"].get(t["model"], 0) + 1
+        # Per-model token buckets so cost can be summed per model (the client
+        # prices each bucket independently, matching the session-row math).
+        bucket_model = t["model"] or "unknown"
+        b = g["_model_tokens"].get(bucket_model)
+        if b is None:
+            b = {"model": bucket_model, "input": 0, "output": 0,
+                 "cache_read": 0, "cache_creation": 0}
+            g["_model_tokens"][bucket_model] = b
+        b["input"] += t["input_tokens"] or 0
+        b["output"] += t["output_tokens"] or 0
+        b["cache_read"] += t["cache_read_tokens"] or 0
+        b["cache_creation"] += t["cache_creation_tokens"] or 0
+
+    initial = new_group(None, "", is_initial=True)
+    prompt_groups = [new_group(p["text"], p["timestamp"]) for p in prompts]
+
+    p_idx = 0
+    for t in turns:
+        ts = t["timestamp"] or ""
+        while p_idx < len(prompts) and (prompts[p_idx]["timestamp"] or "") <= ts:
+            p_idx += 1
+        target = prompt_groups[p_idx - 1] if p_idx > 0 else initial
+        add_turn(target, t)
+
+    ordered = ([initial] if initial["turn_count"] > 0 else []) + prompt_groups
+    result = []
+    for g in ordered:
+        if g["turn_count"] == 0:
+            continue
+        models = g.pop("_models")
+        g["model"] = max(models, key=models.get) if models else "unknown"
+        g["by_model"] = list(g.pop("_model_tokens").values())
+        g["tools"] = [{"name": k, "count": v} for k, v in
+                      sorted(g["tools"].items(), key=lambda kv: -kv[1])]
+        result.append(g)
+    return result
+
+
+def _session_insights(groups, turns, srow):
+    """Per-session inefficiency insights (a scoped subset of claude-spend's)."""
+    insights = []
+    turn_count = srow["turn_count"] or 0
+    total_output = srow["total_output_tokens"] or 0
+    cache_read = srow["total_cache_read"] or 0
+    input_tokens = srow["total_input_tokens"] or 0
+    cache_creation = srow["total_cache_creation"] or 0
+    total_tokens = input_tokens + total_output + cache_read + cache_creation
+    model = (srow["model"] or "").lower()
+    prompt_groups = [g for g in groups if not g["is_initial"]]
+
+    # 1. Short, vague prompt that cost a lot
+    vague = [g for g in prompt_groups
+             if g["text"] and len(g["text"].strip()) < 30
+             and (g["input"] + g["output"] + g["cache_read"] + g["cache_creation"]) > 100_000]
+    if vague:
+        worst = max(vague, key=lambda g: g["input"] + g["output"] + g["cache_read"] + g["cache_creation"])
+        worst_tokens = worst["input"] + worst["output"] + worst["cache_read"] + worst["cache_creation"]
+        insights.append({
+            "level": "warning",
+            "title": "A short, vague prompt burned a lot of tokens",
+            "detail": f"The prompt \"{worst['text'].strip()}\" used {_fmt_tokens(worst_tokens)} tokens. "
+                      f"Short instructions force Claude to re-read context and guess what you meant.",
+            "action": "Be specific about the file, function, and desired outcome so Claude finishes in fewer turns.",
+        })
+
+    # 2. Cost-per-turn growth → suggest /clear at an inflection point.
+    # Only surfaced when the tail of the session is genuinely more expensive
+    # (>=2x the early turns), matching the efficiency dot's growth signal.
+    if len(turns) >= 10:
+        totals = [_turn_total(t) for t in turns]
+        first3 = sum(totals[:3]) / 3
+        last3 = sum(totals[-3:]) / 3
+        growth = last3 / first3 if first3 > 0 else 1.0
+        if growth >= 2:
+            baseline = sum(totals[:5]) / 5
+            inflection = None
+            if baseline > 0:
+                for i in range(2, len(totals)):
+                    window = (totals[i] + totals[i - 1] + totals[i - 2]) / 3
+                    if window > baseline * 2:
+                        inflection = i - 1
+                        break
+            turn_ref = inflection if inflection is not None else len(totals) // 2
+            insights.append({
+                "level": "warning",
+                "title": f"Later turns cost ~{growth:.1f}x more than early ones",
+                "detail": "Every turn re-reads the whole conversation, so cost compounds as it grows.",
+                "action": f"Consider /clear after about {turn_ref} turns, pasting a short summary to carry context forward.",
+            })
+
+    # 3. Opus used for a small, simple session
+    if "opus" in model and turn_count < 10 and total_tokens < 200_000:
+        insights.append({
+            "level": "warning",
+            "title": "Opus was used for a small session",
+            "detail": f"This session had {turn_count} turns and {_fmt_tokens(total_tokens)} tokens on Opus, "
+                      f"the most expensive model.",
+            "action": "Use /model to switch to Sonnet or Haiku for quick questions and small edits.",
+        })
+
+    # 4. Tool-heavy relative to prompts
+    tool_turns = sum(1 for t in turns if t["tool_name"])
+    if prompt_groups and tool_turns / len(prompt_groups) > 8:
+        ratio = tool_turns / len(prompt_groups)
+        insights.append({
+            "level": "info",
+            "title": f"~{round(ratio)} tool calls per prompt",
+            "detail": "Each tool call is a full round trip that re-reads the conversation.",
+            "action": "Point Claude at specific files and line numbers to cut down on search/read round trips.",
+        })
+
+    # 5. Cache efficiency (informational)
+    cache_input_side = input_tokens + cache_read + cache_creation
+    if cache_read > 0 and cache_input_side > 0:
+        hit = cache_read / cache_input_side * 100
+        insights.append({
+            "level": "info",
+            "title": f"Cache hit rate {hit:.0f}%",
+            "detail": f"{_fmt_tokens(cache_read)} input tokens were served from cache at ~10x lower cost.",
+            "action": None,
+        })
+
+    return insights
+
+
+def get_session_detail(session_id, db_path=DB_PATH):
+    """Per-session detail: prompt-level cost breakdown + inefficiency insights."""
+    if not db_path.exists():
+        return {"error": "Database not found. Run: python cli.py scan"}
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+
+    srow = conn.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+    if srow is None:
+        conn.close()
+        return {"error": "Session not found"}
+
+    prompts = conn.execute(
+        "SELECT timestamp, text FROM prompts WHERE session_id = ? ORDER BY timestamp, uuid",
+        (session_id,)
+    ).fetchall()
+    turns = conn.execute("""
+        SELECT timestamp, model, input_tokens, output_tokens,
+               cache_read_tokens, cache_creation_tokens, tool_name
+        FROM turns WHERE session_id = ? ORDER BY timestamp, id
+    """, (session_id,)).fetchall()
+    conn.close()
+
+    # Defensive filter: drop any command-wrapper rows a prior scan may have
+    # stored before the capture filter was tightened.
+    prompts = [
+        {"timestamp": p["timestamp"], "text": p["text"]}
+        for p in prompts
+        if p["text"] and not (p["text"].startswith("<command-")
+                              or p["text"].startswith("<local-command"))
+    ]
+    groups = _group_prompts(prompts, turns)
+    insights = _session_insights(groups, turns, srow)
+
+    return {
+        "session_id": session_id,
+        "model": srow["model"] or "unknown",
+        "prompts": groups,
+        "insights": insights,
     }
 
 
@@ -141,6 +454,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     --accent: #d97757;
     --blue: #48A0C7;
     --green: #74C991;
+    --amber: #D9A441;
     --red: #C74E39;
     --raised: #2E2F31;  /* hover / raised surfaces — top of the elevation ladder */
     --selected: #262626;  /* selected chips / tabs (neutral, not accent) */
@@ -248,6 +562,33 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .show-more-link { color: var(--blue); text-decoration: none; font-size: 12px; cursor: pointer; }
   .show-more-link:hover { text-decoration: underline; }
 
+  /* Per-session efficiency + expandable prompt breakdown */
+  .eff-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; vertical-align: middle; }
+  .eff-green  { background: var(--green); box-shadow: 0 0 0 2px rgba(116,201,145,0.18); }
+  .eff-yellow { background: var(--amber); box-shadow: 0 0 0 2px rgba(217,164,65,0.18); }
+  .eff-red    { background: var(--red);   box-shadow: 0 0 0 2px rgba(199,78,57,0.18); }
+  tr.session-row { cursor: pointer; }
+  .expand-caret { display: inline-block; width: 10px; color: var(--muted); font-size: 10px; transition: transform 0.15s ease; }
+  tr.session-row.open .expand-caret { transform: rotate(90deg); }
+  tr.detail-row td { background: var(--bg); padding: 0; }
+  tr.detail-row:hover td { background: var(--bg); }
+  .detail-wrap { padding: 16px 18px; }
+  .detail-loading, .detail-empty { color: var(--muted); font-size: 12px; padding: 6px 0; }
+  .insight-chips { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
+  .insight { border: 1px solid var(--border); border-left-width: 3px; border-radius: 6px; padding: 8px 12px; font-size: 12px; background: var(--card); }
+  .insight.warning { border-left-color: var(--red); }
+  .insight.info { border-left-color: var(--blue); }
+  .insight-title { font-weight: 600; color: var(--text); }
+  .insight-detail { color: var(--muted); margin-top: 3px; }
+  .insight-action { color: var(--text); margin-top: 4px; }
+  .prompt-table { width: 100%; border-collapse: collapse; }
+  .prompt-table th { font-size: 10px; }
+  .prompt-table td { font-size: 12px; padding: 8px 12px; vertical-align: top; }
+  .prompt-text { max-width: 520px; color: var(--text); white-space: normal; word-break: break-word; }
+  .prompt-text.initial { color: var(--muted); font-style: italic; }
+  tr.prompt-row.hot td { background: rgba(199,78,57,0.09); }
+  .tool-pill { display: inline-block; padding: 1px 6px; margin: 1px 2px 1px 0; border-radius: 4px; font-size: 10px; background: var(--selected); color: var(--muted); }
+
   footer { border-top: 1px solid var(--border); padding: 20px 24px; margin-top: 8px; }
   .footer-content { max-width: 1400px; margin: 0 auto; }
   .footer-content p { color: var(--muted); font-size: 12px; line-height: 1.7; margin-bottom: 4px; }
@@ -337,6 +678,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="section-header"><div class="section-title">Recent Sessions</div><button class="export-btn" onclick="exportSessionsCSV()" title="Export all filtered sessions to CSV">&#x2913; CSV</button></div>
     <table>
       <thead><tr>
+        <th title="Efficiency: green = efficient, amber = moderate, red = inefficient">Eff.</th>
         <th>Session</th>
         <th>Project</th>
         <th class="sortable" onclick="setSessionSort('last')">Last Active <span class="sort-icon" id="sort-icon-last"></span></th>
@@ -528,6 +870,22 @@ function calcCost(model, inp, out, cacheRead, cacheCreation) {
     cacheRead     * p.cache_read  / 1e6 +
     cacheCreation * p.cache_write / 1e6
   );
+}
+
+// A session's turns can span multiple models (main + subagents). Cost must be
+// summed per model, so callers pass the per-model token buckets. Falls back to
+// a single synthetic bucket for older payloads that predate `by_model`.
+function toBuckets(row) {
+  if (row.by_model && row.by_model.length) return row.by_model;
+  return [{ model: row.model, input: row.input, output: row.output,
+            cache_read: row.cache_read, cache_creation: row.cache_creation }];
+}
+function bucketsCost(buckets) {
+  return (buckets || []).reduce((s, b) =>
+    s + calcCost(b.model, b.input, b.output, b.cache_read, b.cache_creation), 0);
+}
+function anyBillable(buckets) {
+  return (buckets || []).some(b => isBillable(b.model));
 }
 
 // ── Formatting ─────────────────────────────────────────────────────────────
@@ -846,7 +1204,7 @@ function applyFilter() {
     p.cache_creation += s.cache_creation;
     p.turns          += s.turns;
     p.sessions++;
-    p.cost += calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
+    p.cost += bucketsCost(toBuckets(s));
   }
   const byProject = Object.values(projMap).sort((a, b) => (b.input + b.output) - (a.input + a.output));
 
@@ -862,7 +1220,7 @@ function applyFilter() {
     pb.cache_creation += s.cache_creation;
     pb.turns          += s.turns;
     pb.sessions++;
-    pb.cost += calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
+    pb.cost += bucketsCost(toBuckets(s));
   }
   const byProjectBranch = Object.values(projBranchMap).sort((a, b) => b.cost - a.cost);
 
@@ -1161,15 +1519,27 @@ function lessProjectRows() { projectLimit  = TABLE_STEPS[0]; renderProjectCostTa
 function moreBranchRows()  { branchLimit   = nextTableLimit(branchLimit,   lastByProjectBranch.length); renderProjectBranchCostTable(lastByProjectBranch); }
 function lessBranchRows()  { branchLimit   = TABLE_STEPS[0]; renderProjectBranchCostTable(lastByProjectBranch); scrollTableToTop('project-branch-cost-body'); }
 
+const sessionDetailCache = {};
+
+function effTitle(e) {
+  if (e === 'red')    return 'Inefficient \u2014 click to see why';
+  if (e === 'yellow') return 'Moderate efficiency \u2014 click to see why';
+  return 'Efficient';
+}
+
 function renderSessionsTable(sessions) {
   const shown = sessions.slice(0, sessionsLimit);
   document.getElementById('sessions-body').innerHTML = shown.map(s => {
-    const cost = calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
-    const costCell = isBillable(s.model)
+    const buckets = toBuckets(s);
+    const cost = bucketsCost(buckets);
+    const costCell = anyBillable(buckets)
       ? `<td class="cost">${fmtCost(cost)}</td>`
       : `<td class="cost-na">n/a</td>`;
-    return `<tr>
-      <td class="muted" style="font-family:monospace">${esc(s.session_id)}&hellip;</td>
+    const eff = s.efficiency || 'green';
+    const sid = s.session_id_full || s.session_id;
+    return `<tr class="session-row" onclick="toggleSession(this, '${esc(sid)}')">
+      <td><span class="eff-dot eff-${eff}" title="${esc(effTitle(eff))}"></span></td>
+      <td class="muted" style="font-family:monospace"><span class="expand-caret">&#9656;</span> ${esc(s.session_id)}&hellip;</td>
       <td>${esc(s.project)}</td>
       <td class="muted">${esc(s.last)}</td>
       <td class="muted">${esc(s.duration_min)}m</td>
@@ -1178,9 +1548,84 @@ function renderSessionsTable(sessions) {
       <td class="num">${fmt(s.input)}</td>
       <td class="num">${fmt(s.output)}</td>
       ${costCell}
-    </tr>`;
+    </tr>
+    <tr class="detail-row" id="detail-${esc(sid)}" style="display:none"><td colspan="10"><div class="detail-wrap"></div></td></tr>`;
   }).join('');
   renderTableToggle('sessions-foot', sessions.length, sessionsLimit, 'lessSessionRows', 'moreSessionRows', 'exportSessionsCSV');
+}
+
+function toggleSession(rowEl, sid) {
+  const detail = document.getElementById('detail-' + sid);
+  if (!detail) return;
+  const isOpen = detail.style.display !== 'none';
+  if (isOpen) {
+    detail.style.display = 'none';
+    rowEl.classList.remove('open');
+    return;
+  }
+  detail.style.display = '';
+  rowEl.classList.add('open');
+  const wrap = detail.querySelector('.detail-wrap');
+  if (wrap.dataset.loaded === '1') return;
+  if (sessionDetailCache[sid]) {
+    wrap.innerHTML = renderSessionDetail(sessionDetailCache[sid]);
+    wrap.dataset.loaded = '1';
+    return;
+  }
+  wrap.innerHTML = '<div class="detail-loading">Loading prompt breakdown&hellip;</div>';
+  fetch('/api/session?id=' + encodeURIComponent(sid))
+    .then(r => r.json())
+    .then(d => { sessionDetailCache[sid] = d; wrap.innerHTML = renderSessionDetail(d); wrap.dataset.loaded = '1'; })
+    .catch(() => { wrap.innerHTML = '<div class="detail-empty">Could not load session detail.</div>'; });
+}
+
+function renderSessionDetail(d) {
+  if (!d || d.error) {
+    return '<div class="detail-empty">' + esc(d && d.error ? d.error : 'No detail available.') + '</div>';
+  }
+  const insights = (d.insights || []).map(i => `
+    <div class="insight ${i.level === 'warning' ? 'warning' : 'info'}">
+      <div class="insight-title">${esc(i.title)}</div>
+      <div class="insight-detail">${esc(i.detail)}</div>
+      ${i.action ? '<div class="insight-action">\u2192 ' + esc(i.action) + '</div>' : ''}
+    </div>`).join('');
+  const chips = insights ? '<div class="insight-chips">' + insights + '</div>' : '';
+
+  const prompts = (d.prompts || []).map(p => ({
+    ...p, _cost: bucketsCost(toBuckets(p)),
+  }));
+  if (!prompts.length) {
+    return chips + '<div class="detail-empty">No per-prompt data captured for this session yet. '
+         + 'Run a scan after your next Claude Code session to populate it.</div>';
+  }
+  const maxCost = Math.max(0, ...prompts.map(p => p._cost));
+  const rows = prompts.map(p => {
+    const total = (p.input || 0) + (p.output || 0) + (p.cache_read || 0) + (p.cache_creation || 0);
+    const hot = (!p.is_initial && maxCost > 0 && p._cost >= maxCost * 0.5) ? ' hot' : '';
+    const label = p.is_initial
+      ? '<span class="prompt-text initial">Initial context (before first prompt)</span>'
+      : '<span class="prompt-text">' + esc(p.text || '') + '</span>';
+    const tools = (p.tools || []).slice(0, 6)
+      .map(t => '<span class="tool-pill">' + esc(t.name) + ' &times;' + t.count + '</span>').join('');
+    const costCell = anyBillable(toBuckets(p))
+      ? '<td class="cost">' + fmtCost(p._cost) + '</td>'
+      : '<td class="cost-na">n/a</td>';
+    return `<tr class="prompt-row${hot}">
+      <td>${label}</td>
+      <td class="num">${p.turn_count}</td>
+      <td class="num">${fmt(total)}</td>
+      <td class="num">${fmt(p.output)}</td>
+      ${costCell}
+      <td>${tools || '<span class="muted">&mdash;</span>'}</td>
+    </tr>`;
+  }).join('');
+  return chips + `
+    <table class="prompt-table">
+      <thead><tr>
+        <th>Prompt</th><th>Turns</th><th>Tokens</th><th>Output</th><th>Est. Cost</th><th>Tools</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
 }
 
 function setModelSort(col) {
@@ -1368,10 +1813,10 @@ function exportModelCSV() {
 }
 
 function exportSessionsCSV() {
-  const header = ['Session', 'Project', 'Last Active', 'Duration (min)', 'Model', 'Turns', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Est. Cost'];
+  const header = ['Session', 'Efficiency', 'Project', 'Last Active', 'Duration (min)', 'Model', 'Turns', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Est. Cost'];
   const rows = lastFilteredSessions.map(s => {
-    const cost = calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
-    return [s.session_id, s.project, s.last, s.duration_min, s.model, s.turns, s.input, s.output, s.cache_read, s.cache_creation, cost.toFixed(4)];
+    const cost = bucketsCost(toBuckets(s));
+    return [s.session_id, s.efficiency || 'green', s.project, s.last, s.duration_min, s.model, s.turns, s.input, s.output, s.cache_read, s.cache_creation, cost.toFixed(4)];
   });
   downloadCSV('sessions', header, rows);
 }
@@ -1502,6 +1947,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         elif path == "/api/data":
             data = get_dashboard_data()
+            body = json.dumps(data).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif path == "/api/session":
+            params = parse_qs(urlparse(self.path).query)
+            session_id = (params.get("id") or [""])[0]
+            # Pass DB_PATH explicitly: the module global may be monkey-patched
+            # (tests), and get_session_detail's default arg is frozen at def time.
+            data = get_session_detail(session_id, db_path=DB_PATH) if session_id else {"error": "Missing session id"}
             body = json.dumps(data).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
